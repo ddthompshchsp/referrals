@@ -85,10 +85,10 @@ def make_unique(names: list[str]) -> list[str]:
 
 def parse_services_referrals_keep_all(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Build a tidy table that preserves ALL columns from the 10433 export.
-    - Detects the most likely header row
-    - Cleans headers (remove ST:/FD:) and keeps them unique
-    - Drops completely empty rows
+    Preserve ALL columns from the 10433 export:
+    - Detect header row
+    - Clean headers (remove ST:/FD:) and ensure uniqueness
+    - Drop completely empty rows
     """
     header_row = detect_header_row(df_raw)
     raw_headers = df_raw.iloc[header_row].tolist()
@@ -105,7 +105,6 @@ def parse_services_referrals_keep_all(df_raw: pd.DataFrame) -> pd.DataFrame:
     cleaned = [clean_header_name(c) for c in body.columns]
     cleaned = make_unique(cleaned)
     body.columns = cleaned
-
     return body
 
 def _col_letter(n: int) -> str:
@@ -117,7 +116,7 @@ def _col_letter(n: int) -> str:
     return s
 
 def pick_count_column_index(df: pd.DataFrame) -> int:
-    """Pick a robust column to use for visible-row counting with SUBTOTAL(103,...)."""
+    """Pick a robust column to use if we can't find General Service."""
     best_idx, best_score, best_bonus = 0, -1, -1
     for i in range(df.shape[1]):
         s = df.iloc[:, i]
@@ -128,6 +127,29 @@ def pick_count_column_index(df: pd.DataFrame) -> int:
         if (score > best_score) or (score == best_score and bonus > best_bonus):
             best_idx, best_score, best_bonus = i, score, bonus
     return best_idx
+
+def find_general_service_index(df: pd.DataFrame) -> int | None:
+    """
+    Try to locate the 'General Service' column (post-cleaning).
+    Checks common variants: 'General Service', 'Provided Label', 'Service' (but not 'Detailed' or 'Type' or 'Result').
+    """
+    candidates_exact = ["general service"]
+    candidates_contains = ["general service", "provided label"]
+    # 1) exact match
+    for i, c in enumerate(df.columns):
+        if _normalize(c) in candidates_exact:
+            return i
+    # 2) contains match
+    for i, c in enumerate(df.columns):
+        cn = _normalize(c)
+        if any(k in cn for k in candidates_contains):
+            return i
+    # 3) broad 'service' but not detailed/type/result
+    for i, c in enumerate(df.columns):
+        cn = _normalize(c)
+        if "service" in cn and all(excl not in cn for excl in ["detailed", "type", "result"]):
+            return i
+    return None
 
 def is_probably_numeric_series(s: pd.Series) -> bool:
     """Heuristic for numeric columns."""
@@ -144,18 +166,29 @@ def is_probably_date_series(s: pd.Series, header: str) -> bool:
     ratio = (parsed.notna().mean() if len(parsed) else 0.0)
     return name_has_date or (has_any and ratio >= 0.5)
 
+def format_dates_for_preview(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with any date-like columns displayed as mm/dd/yy strings."""
+    out = df.copy()
+    for col in out.columns:
+        if is_probably_date_series(out[col], header=col):
+            dt = pd.to_datetime(out[col], errors="coerce", infer_datetime_format=True)
+            mask = dt.notna()
+            out.loc[mask, col] = dt[mask].dt.strftime("%m/%d/%y")
+            # Keep non-parsable values as-is (strings)
+    return out
+
 # ----------------------------
-# Excel Writer (same styling + date formats + dynamic totals)
+# Excel Writer (same styling + mm/dd/yy + single dynamic total)
 # ----------------------------
 def to_styled_excel(df: pd.DataFrame) -> bytes:
     """
     - Same aesthetics: logo, title block, blue header, borders, thick outer box
     - Auto-format date-like columns to mm/dd/yy (display only)
-    - Dynamic totals row:
-        * SUBTOTAL(103, …) for visible row count in a robust text/date column
-        * SUBTOTAL(109, …) to sum visible values for numeric columns
+    - ONE grand total only: count visible rows in the 'General Service' column (dynamic with filters)
+      * Label cell reads 'Total'
+      * Value cell uses SUBTOTAL(103, ...)
     """
-    # Prepare a copy for export and convert date-like columns to datetime64
+    # Prepare a copy for export and convert date-like columns to datetime64 (for Excel formatting)
     df_xls = df.copy()
     date_like_idx = []
     for j, col in enumerate(df_xls.columns):
@@ -183,16 +216,16 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
         # Logo at B1 (53% scale)
         logo = Path("header_logo.png")
         if logo.exists():
-            ws.set_column(1, 1, 6)  # column B width for logo
+            ws.set_column(1, 1, 6)
             ws.insert_image(0, 1, str(logo), {
                 "x_offset": 2, "y_offset": 2,
                 "x_scale": 0.53, "y_scale": 0.53,
                 "object_position": 1
             })
 
-        # Titles across C..last
+        # Titles across C..last (date only mm/dd/yy)
         now_ct = datetime.now(ZoneInfo("America/Chicago"))
-        date_str = now_ct.strftime("%m.%d.%y %I:%M %p CT")
+        date_str = now_ct.strftime("%m/%d/%y")
 
         title_fmt    = wb.add_format({"bold": True, "font_size": 14, "align": "center"})
         subtitle_fmt = wb.add_format({"bold": True, "font_size": 12, "align": "center"})
@@ -242,7 +275,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
             "name": 26,
             "id": 16,
         }
-        date_fmt = wb.add_format({"num_format": "mm/dd/yy"})  # <- two-digit year
+        date_fmt = wb.add_format({"num_format": "mm/dd/yy"})  # two-digit year
         for idx, name in enumerate(df_xls.columns):
             key = _normalize(name)
             width = default_width
@@ -261,32 +294,26 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
             "type": "formula", "criteria": "TRUE", "format": border_all
         })
 
-        # ---- Dynamic totals row (counts visible rows, sums numeric columns) ----
+        # ---- Single dynamic TOTAL at the bottom (for General Service only) ----
         totals_label_fmt = wb.add_format({"bold": True, "align": "right"})
         totals_val_fmt   = wb.add_format({"bold": True, "align": "center"})
         totals_row_0     = last_row_0 + 1          # 0-based row index for totals
         totals_excel_row = last_excel_row + 1      # 1-based Excel row number for totals
 
         # Label in first column
-        ws.write(totals_row_0, 0, "Totals (visible):", totals_label_fmt)
+        ws.write(totals_row_0, 0, "Total", totals_label_fmt)
 
-        # Choose a robust column for counting visible rows
-        count_idx = pick_count_column_index(df_xls)
-        count_letter = _col_letter(count_idx)
-        count_range = f"{count_letter}{data_first_excel_row}:{count_letter}{last_excel_row}"
-        ws.write_formula(totals_row_0, count_idx, f"=SUBTOTAL(103,{count_range})", totals_val_fmt)
+        # Find the General Service column; fallback to robust count column if needed
+        gs_idx = find_general_service_index(df_xls)
+        if gs_idx is None:
+            gs_idx = pick_count_column_index(df_xls)
 
-        # For every other column: if it's numeric-ish, write a SUBTOTAL(109, ...) to sum visible
-        for j in range(df_xls.shape[1]):
-            if j == count_idx:
-                continue
-            s = df_xls.iloc[:, j]
-            if is_probably_numeric_series(s):
-                col_letter = _col_letter(j)
-                rng = f"{col_letter}{data_first_excel_row}:{col_letter}{last_excel_row}"
-                ws.write_formula(totals_row_0, j, f"=SUBTOTAL(109,{rng})", totals_val_fmt)
+        gs_letter = _col_letter(gs_idx)
+        data_range = f"{gs_letter}{data_first_excel_row}:{gs_letter}{last_excel_row}"
+        # Count visible, non-empty cells in General Service
+        ws.write_formula(totals_row_0, gs_idx, f"=SUBTOTAL(103,{data_range})", totals_val_fmt)
 
-        # Optional: draw borders around totals row too
+        # Draw borders around totals row too
         ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}", {
             "type": "formula", "criteria": "TRUE", "format": border_all
         })
@@ -316,8 +343,11 @@ if process and sref_file:
         raw = pd.read_excel(sref_file, sheet_name=0, header=None)
         tidy = parse_services_referrals_keep_all(raw)
 
+        # Preview with dates as mm/dd/yy strings
+        preview_df = format_dates_for_preview(tidy)
+
         st.success("Preview below. Use the download button to get the Excel file.")
-        st.dataframe(tidy, use_container_width=True)
+        st.dataframe(preview_df, use_container_width=True)
 
         xlsx_bytes = to_styled_excel(tidy)
         st.download_button(
