@@ -43,29 +43,10 @@ with inp_c:
     process = st.button("Process & Download")
 
 # ----------------------------
-# Column detection helpers
+# Helpers
 # ----------------------------
 def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip().lower())
-
-def find_col(headers, candidates):
-    """
-    Find the first header whose normalized text contains any candidate
-    (tries exact match first). Returns actual column name or None.
-    """
-    norm_map = {h: _normalize(str(h)) for h in headers}
-    cand_norm = [_normalize(c) for c in candidates]
-    # exact
-    for c in cand_norm:
-        for h, n in norm_map.items():
-            if n == c:
-                return h
-    # contains
-    for c in cand_norm:
-        for h, n in norm_map.items():
-            if c in n:
-                return h
-    return None
+    return re.sub(r"\s+", " ", str(s).strip().lower())
 
 def detect_header_row(df_raw: pd.DataFrame) -> int:
     """
@@ -73,8 +54,8 @@ def detect_header_row(df_raw: pd.DataFrame) -> int:
     """
     nrows = len(df_raw)
     best_idx, best_score = 0, -1
-    keywords = ["date", "service", "result", "provided label", "detailed", "author", "staff", "user"]
-    for i in range(min(nrows, 40)):
+    keywords = ["date", "service", "result", "provided label", "detailed", "author", "staff", "user", "center", "name"]
+    for i in range(min(nrows, 60)):
         row_vals = [str(v) for v in df_raw.iloc[i].tolist()]
         st_like = sum(1 for v in row_vals if isinstance(v, str) and v.strip().startswith("ST:"))
         kw_score = sum(1 for v in row_vals if any(k in str(v).lower() for k in keywords))
@@ -83,87 +64,99 @@ def detect_header_row(df_raw: pd.DataFrame) -> int:
             best_score, best_idx = score, i
     return best_idx
 
-# ----------------------------
-# Parser (10433)
-# ----------------------------
-def parse_services_referrals(df_raw: pd.DataFrame) -> pd.DataFrame:
+def parse_services_referrals_keep_all(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Builds a tidy table with columns:
-      Date | General Service | Detailed Service | Service Author | Result
+    Build a tidy table that preserves ALL columns from the 10433 export.
+    - Detects the most likely header row
+    - Constructs a body DataFrame using that header row
+    - Drops completely empty rows
     """
     header_row = detect_header_row(df_raw)
     headers = df_raw.iloc[header_row].tolist()
     body = pd.DataFrame(df_raw.iloc[header_row + 1:].values, columns=headers)
 
-    # Candidate names for each output column
-    date_cands = [
-        "ST: Date", "ST: Service Date", "ST: Contact Date", "Date", "Service Date", "Provided Date"
-    ]
-    gen_service_cands = [
-        "ST: General Service", "General Service", "Provided Label", "Service", "Service (General)"
-    ]
-    det_service_cands = [
-        "ST: Detailed Service", "Detailed Service", "Detail Service", "Service (Detail)", "Service Detail"
-    ]
-    author_cands = [
-        "ST: Service Author", "Service Author", "Provided By", "Staff", "Staff Name", "User", "ST: User", "ST: Staff Member"
-    ]
-    result_cands = [
-        "ST: Result", "Result", "Service Result", "Outcome"
-    ]
+    # Drop rows that are entirely empty/blank
+    def _row_is_empty(r: pd.Series) -> bool:
+        s = r.astype(str).str.strip()
+        s = s.replace({"nan": "", "NaT": ""})
+        return r.isna().all() or s.eq("").all()
 
-    date_col   = find_col(body.columns, date_cands)
-    gen_col    = find_col(body.columns, gen_service_cands)
-    det_col    = find_col(body.columns, det_service_cands)
-    author_col = find_col(body.columns, author_cands)
-    res_col    = find_col(body.columns, result_cands)
+    body = body[~body.apply(_row_is_empty, axis=1)].reset_index(drop=True)
 
-    missing = [("Date", date_col), ("General Service", gen_col),
-               ("Detailed Service", det_col), ("Service Author", author_col), ("Result", res_col)]
-    missing_names = [name for name, col in missing if col is None]
-    if missing_names:
-        raise ValueError(
-            "Could not find required column(s): " + ", ".join(missing_names) +
-            ". Please confirm 10433 export headers or share a sample row."
-        )
+    # Keep order; ensure columns are strings for Excel safety
+    body.columns = [str(c) for c in body.columns]
+    return body
 
-    out = body[[date_col, gen_col, det_col, author_col, res_col]].copy()
-    out.columns = ["Date", "General Service", "Detailed Service", "Service Author", "Result"]
+def _col_letter(n: int) -> str:
+    """0-based index to Excel column letters."""
+    s = ""
+    while n >= 0:
+        s = chr(n % 26 + 65) + s
+        n = n // 26 - 1
+    return s
 
-    # Date coercion (safe)
-    try:
-        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    except Exception:
-        pass
+def pick_count_column_index(df: pd.DataFrame) -> int:
+    """
+    Pick a robust column to use for visible-row counting with SUBTOTAL(103,...).
+    """
+    best_idx, best_score, best_bonus = 0, -1, -1
+    for i in range(df.shape[1]):
+        s = df.iloc[:, i]
+        s_str = s.astype(str).str.strip()
+        nonempty = (s.notna()) & (s_str.ne("")) & (~s_str.isin(["nan", "NaT"]))
+        score = int(nonempty.sum())
+        bonus = 1 if s.dtype == object else 0
+        if (score > best_score) or (score == best_score and bonus > best_bonus):
+            best_idx, best_score, best_bonus = i, score, bonus
+    return best_idx
 
-    # Drop completely empty rows
-    all_empty = out.apply(lambda r: r.isna().all() or (r.astype(str).str.strip() == "").all(), axis=1)
-    out = out[~all_empty].reset_index(drop=True)
+def is_probably_numeric_series(s: pd.Series) -> bool:
+    """
+    Heuristic for numeric columns: >=50% parseable as numbers AND at least one number.
+    """
+    coerced = pd.to_numeric(s, errors="coerce")
+    if coerced.notna().sum() == 0:
+        return False
+    return coerced.notna().mean() >= 0.5
 
-    # Display-friendly Date
-    if np.issubdtype(out["Date"].dtype, np.datetime64):
-        out["Date"] = out["Date"].dt.date
-
-    return out
+def is_probably_date_series(s: pd.Series, header: str) -> bool:
+    """
+    Heuristic for date-like columns:
+      - Header contains 'date' OR
+      - >=50% of values parse as dates (and at least one)
+    """
+    name_has_date = "date" in _normalize(header)
+    parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+    has_any = parsed.notna().sum() > 0
+    ratio = (parsed.notna().mean() if len(parsed) else 0.0)
+    return name_has_date or (has_any and ratio >= 0.5)
 
 # ----------------------------
-# Excel Writer (same styling + dynamic totals)
+# Excel Writer (same styling + date formats + dynamic totals)
 # ----------------------------
 def to_styled_excel(df: pd.DataFrame) -> bytes:
     """
-    Same aesthetics + dynamic totals row at the bottom (visible rows after filter).
+    - Same aesthetics: logo, title block, blue header, borders, thick outer box
+    - Auto-format date-like columns to MM/DD/YYYY (display only)
+    - Dynamic totals row:
+        * SUBTOTAL(103, …) for visible row count in a robust text/date column
+        * SUBTOTAL(109, …) to sum visible values for numeric columns
     """
-    def col_letter(n: int) -> str:
-        s = ""
-        while n >= 0:
-            s = chr(n % 26 + 65) + s
-            n = n // 26 - 1
-        return s
+    # Prepare a copy for export and convert date-like columns to datetime64
+    df_xls = df.copy()
+    date_like_idx = []
+    for j, col in enumerate(df_xls.columns):
+        if is_probably_date_series(df_xls[col], header=col):
+            dt = pd.to_datetime(df_xls[col], errors="coerce", infer_datetime_format=True)
+            # Only convert if we actually parsed anything
+            if dt.notna().sum() > 0:
+                df_xls[col] = dt
+                date_like_idx.append(j)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         sheet_name = "Head Start Services & Referrals"
-        df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=3)
+        df_xls.to_excel(writer, index=False, sheet_name=sheet_name, startrow=3)
         wb = writer.book
         ws = writer.sheets[sheet_name]
 
@@ -193,12 +186,10 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
         subtitle_fmt = wb.add_format({"bold": True, "font_size": 12, "align": "center"})
         red_fmt      = wb.add_format({"bold": True, "font_size": 12, "font_color": "#C00000"})
 
-        last_col_0 = len(df.columns) - 1
-        last_col_letter = col_letter(last_col_0)
+        last_col_0 = df_xls.shape[1] - 1
+        last_col_letter = _col_letter(last_col_0)
 
-        # Main header line (brand)
         ws.merge_range(0, 2, 0, last_col_0, "Hidalgo County Head Start Program", title_fmt)
-        # Subtitle per your request
         ws.merge_range(1, 2, 1, last_col_0, "", subtitle_fmt)
         ws.write_rich_string(
             1, 2,
@@ -214,50 +205,74 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
             "border": 1
         })
         ws.set_row(3, 26)
-        for c, col in enumerate(df.columns):
+        for c, col in enumerate(df_xls.columns):
             ws.write(3, c, col, header_fmt)
 
         # Geometry
-        last_row_0 = len(df) + 3               # 0-based index of last data row
-        last_excel_row = last_row_0 + 1        # 1-based Excel row number
-        data_first_excel_row = 5               # A5 is first data row (after header in A4)
+        last_row_0 = len(df_xls) + 3               # 0-based index of last data row
+        last_excel_row = last_row_0 + 1            # 1-based Excel row number
+        data_first_excel_row = 5                   # A5 is first data row (after header in A4)
 
         # Filters (no freeze panes)
         ws.autofilter(3, 0, last_row_0, last_col_0)
 
-        # Column widths
-        default_widths = {
-            "Date": 14,
-            "General Service": 30,
-            "Detailed Service": 36,
-            "Service Author": 22,
-            "Result": 20,
+        # Column widths + date formats
+        border_all = wb.add_format({"border": 1})
+        default_width = 20
+        width_overrides = {
+            "date": 14,
+            "general service": 30,
+            "detailed service": 36,
+            "service author": 22,
+            "result": 20,
+            "center": 26,
+            "participant": 26,
+            "name": 26,
+            "id": 16,
         }
-        for name, width in default_widths.items():
-            if name in df.columns:
-                idx = df.columns.get_loc(name)
+        date_fmt = wb.add_format({"num_format": "mm/dd/yyyy"})
+        for idx, name in enumerate(df_xls.columns):
+            key = _normalize(name)
+            width = default_width
+            for k, w in width_overrides.items():
+                if k in key:
+                    width = w
+                    break
+            # Apply date format to detected date-like columns
+            if idx in date_like_idx:
+                ws.set_column(idx, idx, width, date_fmt)
+            else:
                 ws.set_column(idx, idx, width)
 
         # Borders on all header+data cells
-        border_all = wb.add_format({"border": 1})
         ws.conditional_format(f"A4:{last_col_letter}{last_excel_row}", {
             "type": "formula", "criteria": "TRUE", "format": border_all
         })
 
-        # ---- Dynamic totals row (counts visible rows after filter) ----
+        # ---- Dynamic totals row (counts visible rows, sums numeric columns) ----
         totals_label_fmt = wb.add_format({"bold": True, "align": "right"})
         totals_val_fmt   = wb.add_format({"bold": True, "align": "center"})
         totals_row_0     = last_row_0 + 1          # 0-based row index for totals
         totals_excel_row = last_excel_row + 1      # 1-based Excel row number for totals
 
         # Label in first column
-        ws.write(totals_row_0, 0, "Visible Rows (after filter):", totals_label_fmt)
+        ws.write(totals_row_0, 0, "Totals (visible):", totals_label_fmt)
 
-        # Count visible using SUBTOTAL on a robust non-empty column (General Service)
-        gs_idx = df.columns.get_loc("General Service")
-        gs_letter = col_letter(gs_idx)
-        data_range = f"{gs_letter}{data_first_excel_row}:{gs_letter}{last_excel_row}"
-        ws.write_formula(totals_row_0, gs_idx, f"=SUBTOTAL(103,{data_range})", totals_val_fmt)
+        # Choose a robust column for counting visible rows
+        count_idx = pick_count_column_index(df_xls)
+        count_letter = _col_letter(count_idx)
+        count_range = f"{count_letter}{data_first_excel_row}:{count_letter}{last_excel_row}"
+        ws.write_formula(totals_row_0, count_idx, f"=SUBTOTAL(103,{count_range})", totals_val_fmt)
+
+        # For every other column: if it's numeric-ish, write a SUBTOTAL(109, ...) to sum visible
+        for j in range(df_xls.shape[1]):
+            if j == count_idx:
+                continue
+            s = df_xls.iloc[:, j]
+            if is_probably_numeric_series(s):
+                col_letter = _col_letter(j)
+                rng = f"{col_letter}{data_first_excel_row}:{col_letter}{last_excel_row}"
+                ws.write_formula(totals_row_0, j, f"=SUBTOTAL(109,{rng})", totals_val_fmt)
 
         # Optional: draw borders around totals row too
         ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}", {
@@ -287,7 +302,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
 if process and sref_file:
     try:
         raw = pd.read_excel(sref_file, sheet_name=0, header=None)
-        tidy = parse_services_referrals(raw)
+        tidy = parse_services_referrals_keep_all(raw)
 
         st.success("Preview below. Use the download button to get the Excel file.")
         st.dataframe(tidy, use_container_width=True)
@@ -301,5 +316,6 @@ if process and sref_file:
         )
     except Exception as e:
         st.error(f"Processing error: {e}")
+
 
 
