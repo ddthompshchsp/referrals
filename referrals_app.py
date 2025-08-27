@@ -131,32 +131,22 @@ def pick_count_column_index(df: pd.DataFrame) -> int:
 def find_general_service_index(df: pd.DataFrame) -> int | None:
     """
     Try to locate the 'General Service' column (post-cleaning).
-    Checks common variants: 'General Service', 'Provided Label', 'Service' (but not 'Detailed' or 'Type' or 'Result').
+    Checks common variants: 'General Service', 'Provided Label', 'Service' (but not 'Detailed'/'Type'/'Result').
     """
     candidates_exact = ["general service"]
     candidates_contains = ["general service", "provided label"]
-    # 1) exact match
     for i, c in enumerate(df.columns):
         if _normalize(c) in candidates_exact:
             return i
-    # 2) contains match
     for i, c in enumerate(df.columns):
         cn = _normalize(c)
         if any(k in cn for k in candidates_contains):
             return i
-    # 3) broad 'service' but not detailed/type/result
     for i, c in enumerate(df.columns):
         cn = _normalize(c)
         if "service" in cn and all(excl not in cn for excl in ["detailed", "type", "result"]):
             return i
     return None
-
-def is_probably_numeric_series(s: pd.Series) -> bool:
-    """Heuristic for numeric columns."""
-    coerced = pd.to_numeric(s, errors="coerce")
-    if coerced.notna().sum() == 0:
-        return False
-    return coerced.notna().mean() >= 0.5
 
 def is_probably_date_series(s: pd.Series, header: str) -> bool:
     """Heuristic for date-like columns (by header or by parsability)."""
@@ -167,36 +157,29 @@ def is_probably_date_series(s: pd.Series, header: str) -> bool:
     return name_has_date or (has_any and ratio >= 0.5)
 
 def format_dates_for_preview(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with any date-like columns displayed as mm/dd/yy strings."""
+    """Return a copy with any date-like columns displayed as mm/dd/yy strings (preview only)."""
     out = df.copy()
     for col in out.columns:
         if is_probably_date_series(out[col], header=col):
             dt = pd.to_datetime(out[col], errors="coerce", infer_datetime_format=True)
             mask = dt.notna()
             out.loc[mask, col] = dt[mask].dt.strftime("%m/%d/%y")
-            # Keep non-parsable values as-is (strings)
+            # leave non-parsable as-is
     return out
 
 # ----------------------------
-# Excel Writer (same styling + mm/dd/yy + single dynamic total)
+# Excel Writer (no date auto-formatting; single dynamic total)
 # ----------------------------
 def to_styled_excel(df: pd.DataFrame) -> bytes:
     """
     - Same aesthetics: logo, title block, blue header, borders, thick outer box
-    - Auto-format date-like columns to mm/dd/yy (display only)
+    - NO Excel date auto-formatting whatsoever (write values as-is)
     - ONE grand total only: count visible rows in the 'General Service' column (dynamic with filters)
       * Label cell reads 'Total'
       * Value cell uses SUBTOTAL(103, ...)
     """
-    # Prepare a copy for export and convert date-like columns to datetime64 (for Excel formatting)
+    # Do NOT coerce to datetime; keep df as-is for Excel
     df_xls = df.copy()
-    date_like_idx = []
-    for j, col in enumerate(df_xls.columns):
-        if is_probably_date_series(df_xls[col], header=col):
-            dt = pd.to_datetime(df_xls[col], errors="coerce", infer_datetime_format=True)
-            if dt.notna().sum() > 0:
-                df_xls[col] = dt
-                date_like_idx.append(j)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -223,9 +206,9 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
                 "object_position": 1
             })
 
-        # Titles across C..last (date only mm/dd/yy)
+        # Titles across C..last (include Central time)
         now_ct = datetime.now(ZoneInfo("America/Chicago"))
-        date_str = now_ct.strftime("%m/%d/%y")
+        date_str = now_ct.strftime("%m/%d/%y %I:%M %p CT")
 
         title_fmt    = wb.add_format({"bold": True, "font_size": 14, "align": "center"})
         subtitle_fmt = wb.add_format({"bold": True, "font_size": 12, "align": "center"})
@@ -261,7 +244,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
         # Filters (no freeze panes)
         ws.autofilter(3, 0, last_row_0, last_col_0)
 
-        # Column widths + date formats
+        # Column widths (no date formats applied)
         border_all = wb.add_format({"border": 1})
         default_width = 20
         width_overrides = {
@@ -275,7 +258,6 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
             "name": 26,
             "id": 16,
         }
-        date_fmt = wb.add_format({"num_format": "mm/dd/yy"})  # two-digit year
         for idx, name in enumerate(df_xls.columns):
             key = _normalize(name)
             width = default_width
@@ -283,11 +265,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
                 if k in key:
                     width = w
                     break
-            # Apply date format to detected date-like columns
-            if idx in date_like_idx:
-                ws.set_column(idx, idx, width, date_fmt)
-            else:
-                ws.set_column(idx, idx, width)
+            ws.set_column(idx, idx, width)
 
         # Borders on all header+data cells
         ws.conditional_format(f"A4:{last_col_letter}{last_excel_row}", {
@@ -343,8 +321,13 @@ if process and sref_file:
         raw = pd.read_excel(sref_file, sheet_name=0, header=None)
         tidy = parse_services_referrals_keep_all(raw)
 
-        # Preview with dates as mm/dd/yy strings
-        preview_df = format_dates_for_preview(tidy)
+        # Preview: still show date-like columns as mm/dd/yy for readability (Excel uses raw values)
+        preview_df = tidy.copy()
+        for col in preview_df.columns:
+            if is_probably_date_series(preview_df[col], header=col):
+                dt = pd.to_datetime(preview_df[col], errors="coerce", infer_datetime_format=True)
+                mask = dt.notna()
+                preview_df.loc[mask, col] = dt[mask].dt.strftime("%m/%d/%y")
 
         st.success("Preview below. Use the download button to get the Excel file.")
         st.dataframe(preview_df, use_container_width=True)
@@ -358,5 +341,6 @@ if process and sref_file:
         )
     except Exception as e:
         st.error(f"Processing error: {e}")
+
 
 
