@@ -71,16 +71,14 @@ def clean_header_name(h: str) -> str:
 
 def make_unique(names: list[str]) -> list[str]:
     """Ensure column names are unique after cleaning."""
-    seen = {}
-    out = []
+    seen, out = {}, []
     for n in names:
-        base = n
-        if base not in seen:
-            seen[base] = 1
-            out.append(base)
+        if n not in seen:
+            seen[n] = 1
+            out.append(n)
         else:
-            seen[base] += 1
-            out.append(f"{base} ({seen[base]})")
+            seen[n] += 1
+            out.append(f"{n} ({seen[n]})")
     return out
 
 def parse_services_referrals_keep_all(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -103,8 +101,7 @@ def parse_services_referrals_keep_all(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     # Clean headers: strip ST:/FD: and ensure uniqueness
     cleaned = [clean_header_name(c) for c in body.columns]
-    cleaned = make_unique(cleaned)
-    body.columns = cleaned
+    body.columns = make_unique(cleaned)
     return body
 
 def _col_letter(n: int) -> str:
@@ -133,15 +130,18 @@ def find_general_service_index(df: pd.DataFrame) -> int | None:
     Try to locate the 'General Service' column (post-cleaning).
     Checks common variants: 'General Service', 'Provided Label', 'Service' (but not 'Detailed'/'Type'/'Result').
     """
-    candidates_exact = ["general service"]
+    candidates_exact = {"general service"}
     candidates_contains = ["general service", "provided label"]
+    # exact
     for i, c in enumerate(df.columns):
         if _normalize(c) in candidates_exact:
             return i
+    # contains
     for i, c in enumerate(df.columns):
         cn = _normalize(c)
         if any(k in cn for k in candidates_contains):
             return i
+    # broad 'service' but not detailed/type/result
     for i, c in enumerate(df.columns):
         cn = _normalize(c)
         if "service" in cn and all(excl not in cn for excl in ["detailed", "type", "result"]):
@@ -156,15 +156,39 @@ def is_probably_date_series(s: pd.Series, header: str) -> bool:
     ratio = (parsed.notna().mean() if len(parsed) else 0.0)
     return name_has_date or (has_any and ratio >= 0.5)
 
+def _as_datetime_for_preview(series: pd.Series, header: str) -> pd.Series:
+    """
+    Convert mixed date inputs into pandas datetime for preview only.
+    Tries string dates first; then Excel serial numbers (origin 1899-12-30).
+    """
+    # Try normal parsing (strings like '2025-01-31', '01/31/25', etc.)
+    dt1 = pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
+
+    # Try Excel serials (e.g., 45231)
+    num = pd.to_numeric(series, errors="coerce")
+    serial_mask = num.notna() & num.between(20000, 60000)  # rough modern serial range
+    dt2 = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if serial_mask.any():
+        dt2.loc[serial_mask] = pd.to_datetime(
+            num.loc[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
+
+    # Prefer dt1; fill gaps with dt2
+    dt = dt1.copy()
+    dt[dt.isna()] = dt2[dt.isna()]
+    return dt
+
 def format_dates_for_preview(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with any date-like columns displayed as mm/dd/yy strings (preview only)."""
+    """
+    Copy of df where date-like columns (including Excel serial dates) are shown as mm/dd/yy strings.
+    Affects the Streamlit preview only; Excel export still writes raw values.
+    """
     out = df.copy()
     for col in out.columns:
-        if is_probably_date_series(out[col], header=col):
-            dt = pd.to_datetime(out[col], errors="coerce", infer_datetime_format=True)
+        if "date" in _normalize(col) or is_probably_date_series(out[col], header=col):
+            dt = _as_datetime_for_preview(out[col], header=col)
             mask = dt.notna()
             out.loc[mask, col] = dt[mask].dt.strftime("%m/%d/%y")
-            # leave non-parsable as-is
     return out
 
 # ----------------------------
@@ -173,13 +197,12 @@ def format_dates_for_preview(df: pd.DataFrame) -> pd.DataFrame:
 def to_styled_excel(df: pd.DataFrame) -> bytes:
     """
     - Same aesthetics: logo, title block, blue header, borders, thick outer box
-    - NO Excel date auto-formatting whatsoever (write values as-is)
+    - NO Excel-side date coercion/formatting (writes values as-is)
     - ONE grand total only: count visible rows in the 'General Service' column (dynamic with filters)
       * Label cell reads 'Total'
       * Value cell uses SUBTOTAL(103, ...)
     """
-    # Do NOT coerce to datetime; keep df as-is for Excel
-    df_xls = df.copy()
+    df_xls = df.copy()  # write exactly as provided
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -291,7 +314,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
         # Count visible, non-empty cells in General Service
         ws.write_formula(totals_row_0, gs_idx, f"=SUBTOTAL(103,{data_range})", totals_val_fmt)
 
-        # Draw borders around totals row too
+        # Borders around totals row
         ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}", {
             "type": "formula", "criteria": "TRUE", "format": border_all
         })
@@ -321,13 +344,8 @@ if process and sref_file:
         raw = pd.read_excel(sref_file, sheet_name=0, header=None)
         tidy = parse_services_referrals_keep_all(raw)
 
-        # Preview: still show date-like columns as mm/dd/yy for readability (Excel uses raw values)
-        preview_df = tidy.copy()
-        for col in preview_df.columns:
-            if is_probably_date_series(preview_df[col], header=col):
-                dt = pd.to_datetime(preview_df[col], errors="coerce", infer_datetime_format=True)
-                mask = dt.notna()
-                preview_df.loc[mask, col] = dt[mask].dt.strftime("%m/%d/%y")
+        # Preview: display date-like columns as mm/dd/yy (handles Excel serials); Excel gets raw values
+        preview_df = format_dates_for_preview(tidy)
 
         st.success("Preview below. Use the download button to get the Excel file.")
         st.dataframe(preview_df, use_container_width=True)
@@ -341,6 +359,3 @@ if process and sref_file:
         )
     except Exception as e:
         st.error(f"Processing error: {e}")
-
-
-
