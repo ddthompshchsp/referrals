@@ -1,4 +1,6 @@
 streamlit>=1.36
 pandas>=2.2
+numpy>=1.26
 openpyxl>=3.1
-pillow>=10.0
+XlsxWriter>=3.2
+pillow>=10.3
