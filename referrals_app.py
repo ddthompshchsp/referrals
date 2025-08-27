@@ -49,9 +49,7 @@ def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 def detect_header_row(df_raw: pd.DataFrame) -> int:
-    """
-    Auto-detect header row by looking for ST:-style fields and common labels.
-    """
+    """Auto-detect header row by looking for ST:-style fields and common labels."""
     nrows = len(df_raw)
     best_idx, best_score = 0, -1
     keywords = ["date", "service", "result", "provided label", "detailed", "author", "staff", "user", "center", "name"]
@@ -64,27 +62,50 @@ def detect_header_row(df_raw: pd.DataFrame) -> int:
             best_score, best_idx = score, i
     return best_idx
 
+def clean_header_name(h: str) -> str:
+    """Strip 'ST:' or 'FD:' prefixes and collapse whitespace."""
+    s = str(h).strip()
+    s = re.sub(r"^(ST:|FD:)\s*", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def make_unique(names: list[str]) -> list[str]:
+    """Ensure column names are unique after cleaning."""
+    seen = {}
+    out = []
+    for n in names:
+        base = n
+        if base not in seen:
+            seen[base] = 1
+            out.append(base)
+        else:
+            seen[base] += 1
+            out.append(f"{base} ({seen[base]})")
+    return out
+
 def parse_services_referrals_keep_all(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Build a tidy table that preserves ALL columns from the 10433 export.
     - Detects the most likely header row
-    - Constructs a body DataFrame using that header row
+    - Cleans headers (remove ST:/FD:) and keeps them unique
     - Drops completely empty rows
     """
     header_row = detect_header_row(df_raw)
-    headers = df_raw.iloc[header_row].tolist()
-    body = pd.DataFrame(df_raw.iloc[header_row + 1:].values, columns=headers)
+    raw_headers = df_raw.iloc[header_row].tolist()
+    body = pd.DataFrame(df_raw.iloc[header_row + 1:].values, columns=raw_headers)
 
     # Drop rows that are entirely empty/blank
     def _row_is_empty(r: pd.Series) -> bool:
-        s = r.astype(str).str.strip()
-        s = s.replace({"nan": "", "NaT": ""})
+        s = r.astype(str).str.strip().replace({"nan": "", "NaT": ""})
         return r.isna().all() or s.eq("").all()
 
     body = body[~body.apply(_row_is_empty, axis=1)].reset_index(drop=True)
 
-    # Keep order; ensure columns are strings for Excel safety
-    body.columns = [str(c) for c in body.columns]
+    # Clean headers: strip ST:/FD: and ensure uniqueness
+    cleaned = [clean_header_name(c) for c in body.columns]
+    cleaned = make_unique(cleaned)
+    body.columns = cleaned
+
     return body
 
 def _col_letter(n: int) -> str:
@@ -96,9 +117,7 @@ def _col_letter(n: int) -> str:
     return s
 
 def pick_count_column_index(df: pd.DataFrame) -> int:
-    """
-    Pick a robust column to use for visible-row counting with SUBTOTAL(103,...).
-    """
+    """Pick a robust column to use for visible-row counting with SUBTOTAL(103,...)."""
     best_idx, best_score, best_bonus = 0, -1, -1
     for i in range(df.shape[1]):
         s = df.iloc[:, i]
@@ -111,20 +130,14 @@ def pick_count_column_index(df: pd.DataFrame) -> int:
     return best_idx
 
 def is_probably_numeric_series(s: pd.Series) -> bool:
-    """
-    Heuristic for numeric columns: >=50% parseable as numbers AND at least one number.
-    """
+    """Heuristic for numeric columns."""
     coerced = pd.to_numeric(s, errors="coerce")
     if coerced.notna().sum() == 0:
         return False
     return coerced.notna().mean() >= 0.5
 
 def is_probably_date_series(s: pd.Series, header: str) -> bool:
-    """
-    Heuristic for date-like columns:
-      - Header contains 'date' OR
-      - >=50% of values parse as dates (and at least one)
-    """
+    """Heuristic for date-like columns (by header or by parsability)."""
     name_has_date = "date" in _normalize(header)
     parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
     has_any = parsed.notna().sum() > 0
@@ -137,7 +150,7 @@ def is_probably_date_series(s: pd.Series, header: str) -> bool:
 def to_styled_excel(df: pd.DataFrame) -> bytes:
     """
     - Same aesthetics: logo, title block, blue header, borders, thick outer box
-    - Auto-format date-like columns to MM/DD/YYYY (display only)
+    - Auto-format date-like columns to mm/dd/yy (display only)
     - Dynamic totals row:
         * SUBTOTAL(103, …) for visible row count in a robust text/date column
         * SUBTOTAL(109, …) to sum visible values for numeric columns
@@ -148,7 +161,6 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
     for j, col in enumerate(df_xls.columns):
         if is_probably_date_series(df_xls[col], header=col):
             dt = pd.to_datetime(df_xls[col], errors="coerce", infer_datetime_format=True)
-            # Only convert if we actually parsed anything
             if dt.notna().sum() > 0:
                 df_xls[col] = dt
                 date_like_idx.append(j)
@@ -230,7 +242,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
             "name": 26,
             "id": 16,
         }
-        date_fmt = wb.add_format({"num_format": "mm/dd/yyyy"})
+        date_fmt = wb.add_format({"num_format": "mm/dd/yy"})  # <- two-digit year
         for idx, name in enumerate(df_xls.columns):
             key = _normalize(name)
             width = default_width
@@ -316,6 +328,4 @@ if process and sref_file:
         )
     except Exception as e:
         st.error(f"Processing error: {e}")
-
-
 
