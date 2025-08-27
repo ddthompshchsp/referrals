@@ -1,427 +1,296 @@
-# referrals_app.py
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
+# services_referrals_app.py
+import io
 import re
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
 
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.utils.datetime import from_excel
-from openpyxl.chart import BarChart, Reference
-from openpyxl.chart.label import DataLabelList
+st.set_page_config(page_title="HCHSP Services & Referrals", layout="wide")
 
-# ==============================
-# APP SETUP
-# ==============================
-st.set_page_config(page_title="Referrals Formatter", layout="centered")
+# ----------------------------
+# Header (Streamlit UI only)
+# ----------------------------
+logo_path = Path("header_logo.png")
+hdr_l, hdr_c, hdr_r = st.columns([1, 2, 1])
+with hdr_c:
+    if logo_path.exists():
+        st.image(str(logo_path), width=320)
+    st.markdown(
+        "<h1 style='text-align:center; margin: 8px 0 4px;'>Hidalgo County Head Start — Services & Referrals</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <p style='text-align:center; font-size:16px; margin-top:0;'>
+        Upload the <strong>10433</strong> Services/Referrals report (Excel).
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
 
-try:
-    logo = Image.open("header_logo.png")
-    st.image(logo, width=300)
-except Exception:
-    pass
+st.divider()
 
-st.title("HCHSP Referrals Formatter (2025–2026)")
-st.markdown("Upload your **Referrals/Service Tracking** workbook to receive a formatted report with charts.")
+# ----------------------------
+# Inputs
+# ----------------------------
+inp_l, inp_c, inp_r = st.columns([1, 2, 1])
+with inp_c:
+    sref_file = st.file_uploader("Upload *10433.xlsx*", type=["xlsx"], key="sref")
+    process = st.button("Process & Download")
 
-# ==============================
-# EDITABLE MAPPINGS
-# ==============================
-# Map many Detailed Services into a single General Service bucket
-GENERAL_DETAIL_MAP = {
-    "Family Services - Emergency/Crisis": [
-        "Utilities (No water/electricity)", "Fire", "Flood", "Homeless", "No Food", "No Clothing",
-        "Emergency", "Crisis",
-    ],
-    "Family Well-Being (FPA)": [
-        "Assistance Paying for Utilities", "Postpartum", "Employment Assistance", "Home Repairs",
-        "Housing Assistance", "Reproductive Health", "SNAP", "TANF", "SSI", "Substance Abuse", "Tobacco",
-    ],
-    "Families as Lifelong Educators (FPA)": [
-        "FSW Home Visit", "School Readiness", "Volunteer", "Parent Involvement",
-    ],
-    "Families as Learners (FPA)": [
-        "Adult Education", "Job Training", "College", "Literacy", "Career Counseling",
-        "ESL", "Financial Assistance for Education", "Scholarship", "GED", "Abriendo Puertas", "Parent Meeting",
-    ],
-    "Positive Parent-Child Relationship (FPA)": [
-        "Parenting Education", "Parenting Skills", "Research-Based Parenting",
-    ],
-    "Family Engagement in Transition (FPA)": [
-        "Early Childhood Intervention", "ECI", "Transition", "Supporting Transition",
-    ],
-    "Family Connections to Peers and Community (FPA)": [
-        "Incarcerated", "Order of Protection", "Child Care", "CPS", "Child Support",
-        "Marriage", "Family Relationships", "Foster Care", "Adoption", "Immigration",
-        "Separation", "Divorce", "Legal", "Social Support",
-    ],
-    "Families as Advocates and Leaders (FPA)": [
-        "Community Involvement", "Parent Committee", "Policy Council",
-    ],
-    "Education": [
-        "Parent Teacher Conference", "PTC", "Education Service",
-    ],
-    "Disability": [
-        "Suspected IEP", "IFP", "Evaluation", "Disability",
-    ],
-    "Health": [
-        "Medical Condition", "Family Health Education", "Family Dental Education",
-        "Insurance", "Blood Pressure", "Dental", "Dental Home", "Hearing", "Height", "Weight",
-        "Lead", "Medical Home", "Physical", "TB", "Vision", "Immunization",
-    ],
-    "Mental Health": [
-        "Behavior", "Counseling with HCHSP Staff", "Mental Health Education",
-        "Rapid Response", "Consulted with Program Staff", "Consulted with Parent",
-        "Counseling",
-    ],
-    "Nutrition": [
-        "Educational Materials", "Special Diet Menu", "Nutrition Education",
-        "Medical Statement for Special Dietary Needs", "WIC",
-    ],
-    "Transition": [
-        "ECI", "Father Involvement", "Fatherhood Conference",
-    ],
-    "Transportation": [
-        "Transportation",
-    ],
-}
+# ----------------------------
+# Column detection helpers
+# ----------------------------
+def _normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower())
 
-# Optional: map General Service to an internal Department
-GENERAL_TO_DEPARTMENT = {
-    "Family Services - Emergency/Crisis": "Family Services",
-    "Family Well-Being (FPA)": "Family Services",
-    "Families as Lifelong Educators (FPA)": "Family Services",
-    "Families as Learners (FPA)": "Family Services",
-    "Positive Parent-Child Relationship (FPA)": "Family Services",
-    "Family Engagement in Transition (FPA)": "Family Services",
-    "Family Connections to Peers and Community (FPA)": "Family Services",
-    "Families as Advocates and Leaders (FPA)": "Family Services",
-    "Education": "Education",
-    "Disability": "Disability",
-    "Health": "Health",
-    "Mental Health": "Mental Health",
-    "Nutrition": "Nutrition",
-    "Transition": "Education",
-    "Transportation": "Transportation",
-}
-
-# Normalize “direction” of the action (internal/external/service)
-DIRECTION_CANON = {
-    "internal": ["internal", "to agency", "in-house", "agency"],
-    "external": ["external", "outside", "to outside agency", "community"],
-    "service":  ["provided", "service provided", "completed", "delivered"],
-}
-
-def canon_direction(val):
-    if not isinstance(val, str) or not val.strip():
-        return "Unspecified"
-    s = val.lower().strip()
-    for label, variants in DIRECTION_CANON.items():
-        if any(v in s for v in variants):
-            return label.capitalize() if label != "service" else "Service"
-    if s in ("internal", "external", "service"):
-        return s.capitalize()
-    return "Unspecified"
-
-# ==============================
-# HELPERS
-# ==============================
-def pick_best_sheet(xls: pd.ExcelFile) -> str:
-    prefs = ["service", "activity", "referral", "tracking"]
-    for name in xls.sheet_names:
-        low = name.lower()
-        if any(p in low for p in prefs):
-            return name
-    return xls.sheet_names[0]
-
-def find_col(columns, *keywords, default=None):
-    for c in columns:
-        low = str(c).strip().lower()
-        if any(k in low for k in keywords):
-            return c
-    return default
-
-def coerce_to_dt(v):
-    if pd.isna(v):
-        return None
-    if isinstance(v, datetime):
-        return v
-    if isinstance(v, date):
-        return datetime(v.year, v.month, v.day)
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        try:
-            return from_excel(v)
-        except Exception:
-            return None
-    if isinstance(v, str):
-        for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(v.strip(), fmt)
-            except Exception:
-                continue
+def find_col(headers, candidates):
+    """
+    Find the first header whose normalized text contains any of the candidate keywords
+    (OR exact matches). Returns the actual header string, or None if not found.
+    """
+    norm_map = {h: _normalize(str(h)) for h in headers}
+    cand_norm = [_normalize(c) for c in candidates]
+    # try exact then contains
+    for c in cand_norm:
+        for h, n in norm_map.items():
+            if n == c:
+                return h
+    for c in cand_norm:
+        for h, n in norm_map.items():
+            if c in n:
+                return h
     return None
 
-def to_general_service(detail: str) -> str:
-    if not isinstance(detail, str) or not detail.strip():
-        return "Other"
-    s = detail.strip().lower()
-    for general, details in GENERAL_DETAIL_MAP.items():
-        for d in details:
-            if d and d.lower() in s:
-                return general
-    return "Other"
+def detect_header_row(df_raw: pd.DataFrame) -> int:
+    """
+    Try to detect the header row:
+    - Prefer the first row with many 'ST:'-style fields
+    - Fallback: first row with multiple likely labels (Date/Service/Type/Result)
+    - Final fallback: row 0
+    """
+    nrows = len(df_raw)
+    best_idx = None
+    best_score = -1
+    keywords = ["date", "service", "type", "result", "provided label", "detailed"]
+    for i in range(min(nrows, 40)):  # scan first 40 rows
+        row_vals = [str(v) for v in df_raw.iloc[i].tolist()]
+        st_like = sum(1 for v in row_vals if isinstance(v, str) and v.strip().startswith("ST:"))
+        kw_score = sum(1 for v in row_vals if any(k in str(v).lower() for k in keywords))
+        score = st_like * 2 + kw_score  # weight ST: a bit higher
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx if best_idx is not None else 0
 
-# ==============================
-# FILE UPLOAD
-# ==============================
-uploaded = st.file_uploader("Upload file (e.g., PLite_F_Activity_Service_Tracking.xlsx)", type=["xlsx"])
-if not uploaded:
-    st.stop()
+# ----------------------------
+# Parser (10433)
+# ----------------------------
+def parse_services_referrals(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expect a GoEngage export variant. We:
+      1) auto-detect the header row
+      2) build a body DataFrame with those headers
+      3) pick columns (Date, General Service, Detailed Service, Service Type, Result)
+    """
+    header_row = detect_header_row(df_raw)
+    headers = df_raw.iloc[header_row].tolist()
+    body = pd.DataFrame(df_raw.iloc[header_row + 1:].values, columns=headers)
 
-# Read the most relevant sheet
-xls = pd.ExcelFile(uploaded)
-sheet_name = pick_best_sheet(xls)
-df = pd.read_excel(xls, sheet_name=sheet_name)
-df.columns = [str(c).strip() for c in df.columns]
+    # Candidate names for each output column
+    date_cands = [
+        "ST: Date", "ST: Service Date", "ST: Contact Date", "Date", "Service Date", "Provided Date"
+    ]
+    gen_service_cands = [
+        "ST: General Service", "General Service", "Provided Label", "Service", "Service (General)"
+    ]
+    det_service_cands = [
+        "ST: Detailed Service", "Detailed Service", "Detail Service", "Service (Detail)", "Service Detail"
+    ]
+    type_cands = [
+        "ST: Service Type", "Service Type", "Type"
+    ]
+    result_cands = [
+        "ST: Result", "Result", "Service Result", "Outcome"
+    ]
 
-# Key columns (fuzzy)
-pid_col       = find_col(df.columns, "pid", "participant id", "child id", default=None)
-name_col      = find_col(df.columns, "name", "child", "student", default=None)
-detail_col    = find_col(df.columns, "detailed service", "service", "activity/service", "referral type", "service type", "category", default=None)
-dept_col      = find_col(df.columns, "department", "dept", default=None)
-direction_col = find_col(df.columns, "direction", "internal", "external", "service", "provided", "to agency", "outside", default=None)
+    # resolve actual header names
+    date_col = find_col(body.columns, date_cands)
+    gen_col = find_col(body.columns, gen_service_cands)
+    det_col = find_col(body.columns, det_service_cands)
+    type_col = find_col(body.columns, type_cands)
+    res_col  = find_col(body.columns, result_cands)
 
-# Try to identify a primary date column
-date_cols = [c for c in df.columns if re.search(r"date", str(c), re.IGNORECASE)]
-primary_date_col = date_cols[0] if date_cols else None
+    missing = [("Date", date_col), ("General Service", gen_col),
+               ("Detailed Service", det_col), ("Service Type", type_col), ("Result", res_col)]
+    missing_names = [name for name, col in missing if col is None]
+    if missing_names:
+        raise ValueError(
+            "Could not find required column(s): " + ", ".join(missing_names) +
+            ". Please confirm 10433 export headers or share a sample row."
+        )
 
-# Coerce dates
-if primary_date_col:
-    df[primary_date_col] = df[primary_date_col].apply(coerce_to_dt)
+    out = body[[date_col, gen_col, det_col, type_col, res_col]].copy()
+    out.columns = ["Date", "General Service", "Detailed Service", "Service Type", "Result"]
 
-# Ensure Detailed Service and General Service columns
-if detail_col is None:
-    detail_col = "Detailed Service"
-    if detail_col not in df.columns:
-        df[detail_col] = ""
-df["Detailed Service"] = df[detail_col].astype(str).fillna("")
-df["General Service"]  = df["Detailed Service"].apply(to_general_service)
+    # Clean/normalize
+    # Try to coerce Date to datetime, keep original if coercion fails
+    try:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    except Exception:
+        pass
 
-# Department resolution
-if dept_col and dept_col in df.columns:
-    df["Department"] = df[dept_col].fillna("")
-    df.loc[df["Department"].str.strip() == "", "Department"] = df["General Service"].map(GENERAL_TO_DEPARTMENT).fillna("Other")
-else:
-    df["Department"] = df["General Service"].map(GENERAL_TO_DEPARTMENT).fillna("Other")
+    # Drop empty lines (if any)
+    all_empty = out.apply(lambda r: r.isna().all() or (r.astype(str).str.strip() == "").all(), axis=1)
+    out = out[~all_empty].reset_index(drop=True)
 
-# Direction normalization
-if direction_col and direction_col in df.columns:
-    df["Direction"] = df[direction_col].apply(canon_direction)
-else:
-    df["Direction"] = "Unspecified"
+    # Display-friendly Date
+    if np.issubdtype(out["Date"].dtype, np.datetime64):
+        out["Date"] = out["Date"].dt.date
 
-# ==============================
-# WRITE FORMATTED WORKBOOK (Sheet1)
-# ==============================
-title_text = "Referrals / Service Tracking Report 2025–2026"
-central_now = datetime.now(ZoneInfo("America/Chicago"))
-timestamp_text = central_now.strftime("Generated on %B %d, %Y at %I:%M %p %Z")
+    return out
 
-temp_path = "Referrals_Cleaned.xlsx"
-with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-    pd.DataFrame([[title_text]]).to_excel(writer, index=False, header=False, startrow=0, sheet_name="Referrals")
-    pd.DataFrame([[timestamp_text]]).to_excel(writer, index=False, header=False, startrow=1, sheet_name="Referrals")
-    df.to_excel(writer, index=False, startrow=3, sheet_name="Referrals")
+# ----------------------------
+# Excel Writer (same styling)
+# ----------------------------
+def to_styled_excel(df: pd.DataFrame) -> bytes:
+    """
+    Same aesthetics:
+      - Logo at B1 (53%)
+      - Title block centered across C..last
+      - Blue header row; borders on table; thick outer box
+      - Subtitle shows Central Time
+    """
+    def col_letter(n: int) -> str:
+        s = ""
+        while n >= 0:
+            s = chr(n % 26 + 65) + s
+            n = n // 26 - 1
+        return s
 
-wb = load_workbook(temp_path)
-ws = wb["Referrals"]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Head Start Services & Referrals", startrow=3)
+        wb = writer.book
+        ws = writer.sheets["Head Start Services & Referrals"]
 
-filter_row = 4
-data_start = filter_row + 1
-data_end = ws.max_row
-max_col = ws.max_column
+        # Keep Excel gridlines outside
+        ws.hide_gridlines(0)
 
-# Freeze panes: keep PID + headers visible
-ws.freeze_panes = "B5"
+        # Title area heights
+        ws.set_row(0, 24)
+        ws.set_row(1, 22)
+        ws.set_row(2, 20)
 
-# AutoFilter
-ws.auto_filter.ref = f"A{filter_row}:{get_column_letter(max_col)}{data_end}"
+        # Logo at B1 (53% scale)
+        logo = Path("header_logo.png")
+        if logo.exists():
+            ws.set_column(1, 1, 6)  # column B width for logo
+            ws.insert_image(0, 1, str(logo), {
+                "x_offset": 2, "y_offset": 2,
+                "x_scale": 0.53, "y_scale": 0.53,
+                "object_position": 1
+            })
 
-# Merge & center Title + Timestamp across all columns
-ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
-ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max_col)
+        # Titles across C..last
+        now_ct = datetime.now(ZoneInfo("America/Chicago"))
+        date_str = now_ct.strftime("%m.%d.%y %I:%M %p CT")
 
-title_fill = PatternFill(start_color="EFEFEF", end_color="EFEFEF", fill_type="solid")
-ts_fill    = PatternFill(start_color="F7F7F7", end_color="F7F7F7", fill_type="solid")
+        title_fmt = wb.add_format({"bold": True, "font_size": 14, "align": "center"})
+        subtitle_fmt = wb.add_format({"bold": True, "font_size": 12, "align": "center"})
+        red_fmt = wb.add_format({"bold": True, "font_size": 12, "font_color": "#C00000"})
 
-tcell = ws.cell(row=1, column=1)
-tcell.value = title_text
-tcell.font = Font(size=14, bold=True)
-tcell.alignment = Alignment(horizontal="center", vertical="center")
-tcell.fill = title_fill
+        last_col_0 = len(df.columns) - 1
+        last_col_letter = col_letter(last_col_0)
 
-scell = ws.cell(row=2, column=1)
-scell.value = timestamp_text
-scell.font = Font(size=10, italic=True, color="555555")
-scell.alignment = Alignment(horizontal="center", vertical="center")
-scell.fill = ts_fill
+        # Main title line can stay the same brand line
+        ws.merge_range(0, 2, 0, last_col_0, "Hidalgo County Head Start Program", title_fmt)
+        # Subtitle: requested label
+        ws.merge_range(1, 2, 1, last_col_0, "", subtitle_fmt)
+        ws.write_rich_string(1, 2,
+            subtitle_fmt, "Head Start - 2025-2026 Services & Referrals as of ",
+            red_fmt, f"({date_str})",
+            subtitle_fmt
+        )
 
-# Header styling: dark blue + white bold + wrapped
-header_fill = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
-for cell in ws[filter_row]:
-    cell.font = Font(bold=True, color="FFFFFF")
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.fill = header_fill
+        # Header (blue)
+        header_fmt = wb.add_format({
+            "bold": True, "font_color": "white", "bg_color": "#305496",
+            "align": "center", "valign": "vcenter", "text_wrap": True,
+            "border": 1
+        })
+        ws.set_row(3, 26)
+        for c, col in enumerate(df.columns):
+            ws.write(3, c, col, header_fmt)
 
-# Borders & date formatting
-thin_border = Border(
-    left=Side(style="thin"), right=Side(style="thin"),
-    top=Side(style="thin"), bottom=Side(style="thin")
-)
-for r in range(data_start, data_end + 1):
-    for c in range(1, max_col + 1):
-        cell = ws.cell(row=r, column=c)
-        cell.border = thin_border
-        hdr = ws.cell(row=filter_row, column=c).value
-        if isinstance(hdr, str) and "date" in hdr.lower():
-            if isinstance(cell.value, (datetime, date)):
-                cell.number_format = "m/d/yy"
+        # Geometry
+        last_row_0 = len(df) + 3
+        last_excel_row = last_row_0 + 1
 
-# Find Name column index for placing totals after it
-name_col_idx = None
-for c in range(1, max_col + 1):
-    ws.column_dimensions[get_column_letter(c)].width = 14
-    hdr = ws.cell(row=filter_row, column=c).value
-    if isinstance(hdr, str) and "name" in hdr.lower():
-        name_col_idx = c
-if name_col_idx is None:
-    name_col_idx = 2
+        # Filters (no freeze panes)
+        ws.autofilter(3, 0, last_row_0, last_col_0)
 
-# Grand Total at the bottom (no extra wording)
-total_row = ws.max_row + 2
-ws.cell(row=total_row, column=1, value="Grand Total").font = Font(bold=True)
-ws.cell(row=total_row, column=1).alignment = Alignment(horizontal="left", vertical="center")
+        # Column widths tuned for this layout
+        default_widths = {
+            "Date": 14,
+            "General Service": 30,
+            "Detailed Service": 36,
+            "Service Type": 16,
+            "Result": 20,
+        }
+        for name, width in default_widths.items():
+            if name in df.columns:
+                idx = df.columns.get_loc(name)
+                ws.set_column(idx, idx, width)
 
-center = Alignment(horizontal="center", vertical="center")
-for c in range(1, max_col + 1):
-    if c <= name_col_idx:
-        continue
-    count = 0
-    for r in range(data_start, data_end + 1):
-        val = ws.cell(row=r, column=c).value
-        if val not in (None, ""):
-            count += 1
-    cell = ws.cell(row=total_row, column=c, value=count)
-    cell.alignment = center
-    cell.font = Font(bold=True)
-    cell.border = Border(top=Side(style="thin"))
+        # Borders on all header+data cells
+        border_all = wb.add_format({"border": 1})
+        ws.conditional_format(f"A4:{last_col_letter}{last_excel_row}", {
+            "type": "formula", "criteria": "TRUE", "format": border_all
+        })
 
-# ==============================
-# SHEET 2: CHARTS
-# ==============================
-chart_ws = wb.create_sheet("Charts")
+        # Bold nothing special (no group totals in this tool)
+        # Thick outer box (row 1 → end)
+        top    = wb.add_format({"top": 2})
+        bottom = wb.add_format({"bottom": 2})
+        left   = wb.add_format({"left": 2})
+        right  = wb.add_format({"right": 2})
 
-# 1) Referrals by Department
-dept_counts = df["Department"].fillna("Other").value_counts().sort_index().reset_index()
-dept_counts.columns = ["Department", "Count"]
+        ws.conditional_format(f"A1:{last_col_letter}1", {"type": "formula", "criteria": "TRUE", "format": top})
+        ws.conditional_format(f"A1:A{last_excel_row}", {"type": "formula", "criteria": "TRUE", "format": left})
+        ws.conditional_format(f"{last_col_letter}1:{last_col_letter}{last_excel_row}", {"type": "formula", "criteria": "TRUE", "format": right})
+        ws.conditional_format(f"A{last_excel_row}:{last_col_letter}{last_excel_row}", {"type": "formula", "criteria": "TRUE", "format": bottom})
 
-chart_ws.append(["Department", "Count"])
-for _, row in dept_counts.iterrows():
-    chart_ws.append([row["Department"], int(row["Count"])])
+        # Ensure right edge on title rows connects cleanly
+        ws.write(0, last_col_0, "", wb.add_format({"right": 2, "top": 2}))
+        ws.write(1, last_col_0, "", wb.add_format({"right": 2}))
 
-# style header
-chart_ws["A1"].font = Font(bold=True, color="FFFFFF")
-chart_ws["B1"].font = Font(bold=True, color="FFFFFF")
-chart_ws["A1"].fill = header_fill
-chart_ws["B1"].fill = header_fill
-chart_ws.column_dimensions["A"].width = 30
-chart_ws.column_dimensions["B"].width = 12
+    return output.getvalue()
 
-dept_chart = BarChart()
-dept_chart.title = "Referrals by Department"
-dept_chart.y_axis.title = "Count"
-dept_chart.x_axis.title = "Department"
-dept_chart.dataLabels = DataLabelList(showVal=True)
+# ----------------------------
+# Main
+# ----------------------------
+if process and sref_file:
+    try:
+        raw = pd.read_excel(sref_file, sheet_name=0, header=None)
+        tidy = parse_services_referrals(raw)
 
-data = Reference(chart_ws, min_col=2, min_row=1, max_row=dept_counts.shape[0] + 1)
-cats = Reference(chart_ws, min_col=1, min_row=2, max_row=dept_counts.shape[0] + 1)
-dept_chart.add_data(data, titles_from_data=True)
-dept_chart.set_categories(cats)
-chart_ws.add_chart(dept_chart, "D3")
+        st.success("Preview below. Use the download button to get the Excel file.")
+        preview_df = tidy.copy()
+        st.dataframe(preview_df, use_container_width=True)
 
-# 2) Referrals by General Service
-start_row = chart_ws.max_row + 3
-chart_ws.cell(row=start_row, column=1, value="General Service").font = Font(bold=True, color="FFFFFF")
-chart_ws.cell(row=start_row, column=2, value="Count").font = Font(bold=True, color="FFFFFF")
-chart_ws.cell(row=start_row, column=1).fill = header_fill
-chart_ws.cell(row=start_row, column=2).fill = header_fill
+        xlsx_bytes = to_styled_excel(tidy)
+        st.download_button(
+            "Download Services & Referrals (Excel)",
+            data=xlsx_bytes,
+            file_name="HCHSP_Services_Referrals_Formatted.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        st.error(f"Processing error: {e}")
 
-gen_counts = df["General Service"].fillna("Other").value_counts().sort_index().reset_index()
-gen_counts.columns = ["General Service", "Count"]
 
-for i, (_idx, row) in enumerate(gen_counts.iterrows(), start=start_row + 1):
-    chart_ws.cell(row=i, column=1, value=row["General Service"])
-    chart_ws.cell(row=i, column=2, value=int(row["Count"]))
-
-gen_chart = BarChart()
-gen_chart.title = "Referrals by General Service"
-gen_chart.y_axis.title = "Count"
-gen_chart.x_axis.title = "General Service"
-gen_chart.dataLabels = DataLabelList(showVal=True)
-
-data2 = Reference(chart_ws, min_col=2, min_row=start_row, max_row=start_row + gen_counts.shape[0])
-cats2 = Reference(chart_ws, min_col=1, min_row=start_row + 1, max_row=start_row + gen_counts.shape[0])
-gen_chart.add_data(data2, titles_from_data=True)
-gen_chart.set_categories(cats2)
-chart_ws.add_chart(gen_chart, "D20")
-
-# 3) Stacked: General Service by Direction (Internal / External / Service)
-start_row2 = chart_ws.max_row + 3
-# header row
-chart_ws.cell(row=start_row2, column=1, value="General Service").font = Font(bold=True, color="FFFFFF")
-chart_ws.cell(row=start_row2, column=1).fill = header_fill
-
-pivot = pd.pivot_table(df, index="General Service", columns="Direction", aggfunc="size", fill_value=0).reset_index()
-pivot_cols = list(pivot.columns)
-
-# write headers
-for j, col in enumerate(pivot_cols, start=1):
-    cell = chart_ws.cell(row=start_row2, column=j, value=str(col))
-    cell.font = Font(bold=True, color="FFFFFF")
-    cell.fill = header_fill
-
-# write rows
-for i, (_, row) in enumerate(pivot.iterrows(), start=start_row2 + 1):
-    for j, col in enumerate(pivot_cols, start=1):
-        chart_ws.cell(row=i, column=j, value=int(row[col]) if col != "General Service" else row[col])
-
-stack_chart = BarChart()
-stack_chart.type = "col"
-stack_chart.grouping = "stacked"
-stack_chart.title = "General Service by Direction"
-stack_chart.y_axis.title = "Count"
-stack_chart.x_axis.title = "General Service"
-stack_chart.dataLabels = DataLabelList(showVal=True)
-
-min_col = 2
-max_col = 1 + (len(pivot_cols) - 1)
-min_row = start_row2
-max_row = start_row2 + pivot.shape[0]
-stack_data = Reference(chart_ws, min_col=min_col, min_row=min_row, max_col=max_col, max_row=max_row)
-stack_cats = Reference(chart_ws, min_col=1, min_row=min_row + 1, max_row=max_row)
-stack_chart.add_data(stack_data, titles_from_data=True)
-stack_chart.set_categories(stack_cats)
-chart_ws.add_chart(stack_chart, "K3")
-
-# ==============================
-# SAVE & DOWNLOAD
-# ==============================
-final_output = "Formatted_Referrals_Report.xlsx"
-wb.save(final_output)
-
-with open(final_output, "rb") as f:
-    st.download_button("📥 Download Formatted Excel", f, file_name=final_output)
