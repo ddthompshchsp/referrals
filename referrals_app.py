@@ -158,10 +158,13 @@ def is_probably_date_series(s: pd.Series, header: str) -> bool:
 
 def _as_datetime_for_preview(series: pd.Series, header: str) -> pd.Series:
     """
-    Convert mixed date inputs into pandas datetime for preview/filtering only.
+    Convert mixed date inputs into pandas datetime for preview only.
     Tries string dates first; then Excel serial numbers (origin 1899-12-30).
     """
+    # Try normal parsing (strings like '2025-01-31', '01/31/25', etc.)
     dt1 = pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
+
+    # Try Excel serials (e.g., 45231)
     num = pd.to_numeric(series, errors="coerce")
     serial_mask = num.notna() & num.between(20000, 60000)  # rough modern serial range
     dt2 = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
@@ -169,6 +172,8 @@ def _as_datetime_for_preview(series: pd.Series, header: str) -> pd.Series:
         dt2.loc[serial_mask] = pd.to_datetime(
             num.loc[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
         )
+
+    # Prefer dt1; fill gaps with dt2
     dt = dt1.copy()
     dt[dt.isna()] = dt2[dt.isna()]
     return dt
@@ -186,28 +191,37 @@ def format_dates_for_preview(df: pd.DataFrame) -> pd.DataFrame:
             out.loc[mask, col] = dt[mask].dt.strftime("%m/%d/%y")
     return out
 
-def filter_out_before_cutoff(df: pd.DataFrame, cutoff_str: str = "2025-08-01") -> pd.DataFrame:
+def filter_out_before_cutoff_strict(df: pd.DataFrame, cutoff_str: str = "2025-08-01") -> pd.DataFrame:
     """
-    Drop any row where ANY detected date-like column has a value < cutoff.
+    STRICT: Drop any row where ANY cell in ANY column is a date < cutoff.
+    - Parses strings like '8/1/25', '2025-08-01', etc. (coerce errors)
+    - Interprets Excel serials (e.g., 45231) as days since 1899-12-30
+    - Only dates within a plausible window [1900-01-01, 2100-12-31] are considered
     Rows with no parseable dates are kept.
     """
-    cutoff = pd.Timestamp(cutoff_str)
     if df.empty:
         return df
 
-    # Identify date-like columns (by name OR by data)
-    date_cols = []
-    for col in df.columns:
-        if "date" in _normalize(col) or is_probably_date_series(df[col], header=col):
-            date_cols.append(col)
-    if not date_cols:
-        return df.reset_index(drop=True)
+    cutoff = pd.Timestamp(cutoff_str)
+    min_ok, max_ok = pd.Timestamp("1900-01-01"), pd.Timestamp("2100-12-31")
 
-    # Build a mask: drop rows where any date < cutoff
     drop_mask = pd.Series(False, index=df.index)
-    for col in date_cols:
-        dt = _as_datetime_for_preview(df[col], header=col)
-        drop_mask = drop_mask | (dt.notna() & (dt < cutoff))
+
+    for col in df.columns:
+        s = df[col]
+
+        # Try string-like dates
+        dt_str = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+        valid_str = dt_str.notna() & (dt_str.between(min_ok, max_ok))
+        drop_mask |= (valid_str & (dt_str < cutoff))
+
+        # Try Excel serial numbers
+        nums = pd.to_numeric(s, errors="coerce")
+        serial_mask = nums.notna() & nums.between(10000, 70000)  # broaden range a bit
+        if serial_mask.any():
+            dt_serial = pd.to_datetime(nums, unit="D", origin="1899-12-30", errors="coerce")
+            valid_serial = dt_serial.notna() & (dt_serial.between(min_ok, max_ok))
+            drop_mask |= (valid_serial & (dt_serial < cutoff))
 
     return df.loc[~drop_mask].reset_index(drop=True)
 
@@ -364,8 +378,8 @@ if process and sref_file:
         raw = pd.read_excel(sref_file, sheet_name=0, header=None)
         tidy = parse_services_referrals_keep_all(raw)
 
-        # NEW: filter out rows where any date < 08/01/2025
-        tidy = filter_out_before_cutoff(tidy, cutoff_str="2025-08-01")
+        # STRICT FILTER: drop rows where any date in any column is < 08/01/2025
+        tidy = filter_out_before_cutoff_strict(tidy, cutoff_str="2025-08-01")
 
         # Preview: display date-like columns as mm/dd/yy (handles Excel serials); Excel gets raw values
         preview_df = format_dates_for_preview(tidy)
@@ -382,3 +396,4 @@ if process and sref_file:
         )
     except Exception as e:
         st.error(f"Processing error: {e}")
+
