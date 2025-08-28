@@ -129,33 +129,34 @@ def format_dates_for_preview(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ----------------------------
-# Strict filter by Service Date
+# Strict filter by Service Date (only >= cutoff)
 # ----------------------------
 def filter_by_service_date(df: pd.DataFrame, cutoff_str="2025-08-01") -> pd.DataFrame:
     df = df.copy()
     cutoff = pd.Timestamp(cutoff_str)
 
-    # Find Service Date column
+    # Detect Service Date column loosely
     service_date_col = None
     for c in df.columns:
-        if "service date" in _normalize(c):
+        if "service" in _normalize(c) and "date" in _normalize(c):
             service_date_col = c
             break
+
     if service_date_col is None:
         return pd.DataFrame(columns=df.columns)
 
-    # Convert to datetime (string + Excel serial)
+    # Convert to datetime
     dt_series = pd.to_datetime(df[service_date_col], errors="coerce", infer_datetime_format=True)
     nums = pd.to_numeric(df[service_date_col], errors="coerce")
     serial_mask = nums.notna() & nums.between(10000, 70000)
     dt_series[serial_mask] = pd.to_datetime(nums[serial_mask], unit="D", origin="1899-12-30", errors="coerce")
 
-    # Keep rows where Service Date >= cutoff
-    df = df.loc[dt_series >= cutoff].reset_index(drop=True)
-    return df
+    # Keep rows with Service Date >= cutoff
+    filtered_df = df.loc[dt_series >= cutoff].reset_index(drop=True)
+    return filtered_df
 
 # ----------------------------
-# Excel export function (original full version)
+# Excel export function
 # ----------------------------
 def to_styled_excel(df: pd.DataFrame) -> bytes:
     df_xls = df.copy()
@@ -241,6 +242,7 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
 
         ws.write(totals_row_0, 0, "Total", totals_label_fmt)
 
+        # Find General Service column for subtotal
         gs_idx = None
         for i, c in enumerate(df_xls.columns):
             if _normalize(c) in ["general service", "provided label"]:
@@ -255,7 +257,6 @@ def to_styled_excel(df: pd.DataFrame) -> bytes:
 
         ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}", {"type":"formula","criteria":"TRUE","format":border_all})
 
-        # Thick outer box
         top    = wb.add_format({"top": 2})
         bottom = wb.add_format({"bottom": 2})
         left   = wb.add_format({"left": 2})
@@ -308,5 +309,6 @@ if process and sref_file:
 
     except Exception as e:
         st.error(f"Processing error: {e}")
+
 
 
