@@ -48,7 +48,7 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 def detect_header_row(df_raw: pd.DataFrame) -> int:
-    """Heuristic: row with lots of ST: cells and known header keywords."""
+    """Heuristic: row with many ST: cells and header-like keywords."""
     nrows = len(df_raw)
     best_idx, best_score = 0, -1
     keywords = ["date", "service", "result", "provided label", "detailed", "author", "staff", "user", "center", "name"]
@@ -68,8 +68,7 @@ def clean_header(h: str) -> str:
     return s
 
 def uniqueize(names: list[str]) -> list[str]:
-    seen = {}
-    out = []
+    seen, out = {}, []
     for n in names:
         if n not in seen:
             seen[n] = 1
@@ -98,7 +97,7 @@ def parse_to_dt(series: pd.Series) -> pd.Series:
     """
     Parse strings + Excel serials into datetime (NaT on failure).
     - Strings: pd.to_datetime(..., errors='coerce')
-    - Serials: treat plausible numbers as days since 1899-12-30
+    - Serials: plausible numbers as days since 1899-12-30
     """
     dt1 = pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
     num = pd.to_numeric(series, errors="coerce")
@@ -166,7 +165,6 @@ def col_letter(idx: int) -> str:
 
 def find_general_service_idx(df: pd.DataFrame) -> int:
     """Prefer a 'General Service' column; otherwise fallback to the densest text column."""
-    # exact/contains
     for i, c in enumerate(df.columns):
         if _norm(c) == "general service":
             return i
@@ -182,13 +180,16 @@ def find_general_service_idx(df: pd.DataFrame) -> int:
             best_i, best_score = i, score
     return best_i
 
+# =========================
+# Excel writer (with filter-aware Total)
+# =========================
 def to_excel_styled(df: pd.DataFrame) -> bytes:
     """
     Styled Excel:
       - Logo at B1
       - Title + subtitle with CT date/time
       - Blue header; borders; thick outer frame
-      - ONE dynamic Total at bottom: SUBTOTAL(103, <General Service col>)
+      - ONE dynamic Total at bottom: counts VISIBLE rows via hidden helper column + SUBTOTAL(109)
       - No Excel date formatting/coercion (write raw)
     """
     buf = io.BytesIO()
@@ -198,6 +199,7 @@ def to_excel_styled(df: pd.DataFrame) -> bytes:
         wb = writer.book
         ws = writer.sheets[sheet]
 
+        # Layout basics
         ws.hide_gridlines(0)
         ws.set_row(0, 24); ws.set_row(1, 22); ws.set_row(2, 20)
 
@@ -220,13 +222,14 @@ def to_excel_styled(df: pd.DataFrame) -> bytes:
 
         ws.merge_range(0, 2, 0, last_col_0, "Hidalgo County Head Start Program", title_fmt)
         ws.merge_range(1, 2, 1, last_col_0, "", subtitle_fmt)
-        ws.write_rich_string(1, 2,
+        ws.write_rich_string(
+            1, 2,
             subtitle_fmt, "Head Start - 2025-2026 Services and Referrals as of ",
             red_fmt, f"({date_str})",
             subtitle_fmt
         )
 
-        # Header style
+        # Header (blue)
         hdr_fmt = wb.add_format({
             "bold": True, "font_color": "white", "bg_color": "#305496",
             "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1
@@ -235,12 +238,16 @@ def to_excel_styled(df: pd.DataFrame) -> bytes:
         for c, col in enumerate(df.columns):
             ws.write(3, c, col, hdr_fmt)
 
-        # Autofilter
-        last_row_0 = len(df) + 3
-        last_excel_row = last_row_0 + 1
+        # Data region
+        last_row_0 = len(df) + 3           # 0-based last data row index
+        last_excel_row = last_row_0 + 1    # Excel row number
+        data_first_row0 = 4                # 0-based first data row (A5)
+        data_first_excel_row = 5           # Excel row number of first data row
+
+        # Autofilter over visible data (not including helper)
         ws.autofilter(3, 0, last_row_0, last_col_0)
 
-        # Borders
+        # Borders on table
         border_all = wb.add_format({"border": 1})
         ws.conditional_format(f"A4:{last_col_letter}{last_excel_row}",
                               {"type": "formula", "criteria": "TRUE", "format": border_all})
@@ -249,33 +256,51 @@ def to_excel_styled(df: pd.DataFrame) -> bytes:
         default_w = 20
         width_overrides = {
             "date": 14, "general service": 30, "detailed service": 36,
-            "service author": 22, "result": 20, "center": 26, "participant": 26, "name": 26, "id": 16
+            "service author": 22, "result": 20, "center": 26,
+            "participant": 26, "name": 26, "id": 16
         }
         for idx, name in enumerate(df.columns):
             key = _norm(name)
             width = next((w for k, w in width_overrides.items() if k in key), default_w)
             ws.set_column(idx, idx, width)
 
-        # Dynamic Total for General Service
+        # ===== Hidden helper column for filter-aware row count =====
+        helper_idx = last_col_0 + 1
+        helper_letter = col_letter(helper_idx)
+        ws.write(3, helper_idx, "_helper_")  # header to avoid Excel nag
+        for r0 in range(data_first_row0, last_row_0 + 1):
+            ws.write_number(r0, helper_idx, 1)
+        ws.set_column(helper_idx, helper_idx, None, None, {"hidden": 1})
+
+        # ===== Total row (label + dynamic visible row count) =====
         totals_row_0 = last_row_0 + 1
         totals_excel_row = last_excel_row + 1
         label_fmt = wb.add_format({"bold": True, "align": "right"})
         value_fmt = wb.add_format({"bold": True, "align": "center"})
+
         ws.write(totals_row_0, 0, "Total", label_fmt)
 
+        # Place the number under 'General Service' if present; otherwise under the first column
         gs_idx = find_general_service_idx(df)
-        gs_letter = col_letter(gs_idx)
-        data_first_excel_row = 5  # first data row
-        data_range = f"{gs_letter}{data_first_excel_row}:{gs_letter}{last_excel_row}"
-        ws.write_formula(totals_row_0, gs_idx, f"=SUBTOTAL(103,{data_range})", value_fmt)
+        ws.write_formula(
+            totals_row_0, gs_idx,
+            f"=SUBTOTAL(109,{helper_letter}{data_first_excel_row}:{helper_letter}{last_excel_row})",
+            value_fmt
+        )
 
-        # Thick outer box
+        # Border around totals row (visible area only)
+        ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}",
+                              {"type": "formula", "criteria": "TRUE", "format": border_all})
+
+        # Thick outer box around title + visible table (not the hidden helper)
         top = wb.add_format({"top": 2}); bottom = wb.add_format({"bottom": 2})
         left = wb.add_format({"left": 2}); right = wb.add_format({"right": 2})
         ws.conditional_format(f"A1:{last_col_letter}1", {"type": "formula", "criteria": "TRUE", "format": top})
         ws.conditional_format(f"A1:A{totals_excel_row}", {"type": "formula", "criteria": "TRUE", "format": left})
-        ws.conditional_format(f"{last_col_letter}1:{last_col_letter}{totals_excel_row}", {"type": "formula", "criteria": "TRUE", "format": right})
-        ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}", {"type": "formula", "criteria": "TRUE", "format": bottom})
+        ws.conditional_format(f"{last_col_letter}1:{last_col_letter}{totals_excel_row}",
+                              {"type": "formula", "criteria": "TRUE", "format": right})
+        ws.conditional_format(f"A{totals_excel_row}:{last_col_letter}{totals_excel_row}",
+                              {"type": "formula", "criteria": "TRUE", "format": bottom})
 
         # Ensure right edge on title rows
         ws.write(0, last_col_0, "", wb.add_format({"right": 2, "top": 2}))
