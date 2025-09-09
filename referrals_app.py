@@ -186,11 +186,31 @@ def write_excel(df, summary, author_fix, cols, cutoff_date):
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.title("HCHSP Services & Referrals Tool")
 
-uploaded_file = st.file_uploader("Upload 10433 Services & Referrals Excel file", type=["xlsx"])
+st.set_page_config(page_title="HCHSP Enrollment", layout="wide")
 
-cutoff_date = st.date_input("Cutoff date", datetime(2025, 8, 11))
+# ----------------------------
+# Header (Streamlit UI only)
+# ----------------------------
+logo_path = Path("header_logo.png")
+hdr_l, hdr_c, hdr_r = st.columns([1, 2, 1])
+with hdr_c:
+    if logo_path.exists():
+        st.image(str(logo_path), width=320)
+    st.markdown(
+        "<h1 style='text-align:center; margin: 8px 0 4px;'>Hidalgo County Head Start — Enrollment Formatter</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <p style='text-align:center; font-size:16px; margin-top:0;'>
+        Upload the VF Average Funded Enrollment report and the 25–26 Applied/Accepted report.
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
