@@ -187,7 +187,7 @@ def write_excel(df, summary, author_fix, cols, cutoff_date):
 # Streamlit UI
 # -------------------------
 
-st.set_page_config(page_title="HCHSP Enrollment", layout="wide")
+st.set_page_config(page_title="HCHSP Referrals and Services", layout="wide")
 
 # ----------------------------
 # Header (Streamlit UI only)
@@ -208,7 +208,7 @@ with hdr_c:
         </p>
         """,
         unsafe_allow_html=True,
-    )
+
 
 
 
