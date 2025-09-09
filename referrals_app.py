@@ -186,7 +186,7 @@ def write_excel(df, summary, author_fix, cols, cutoff_date):
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.title("📊 HCHSP Services & Referrals Tool")
+st.title("HCHSP Services & Referrals Tool")
 
 uploaded_file = st.file_uploader("Upload 10433 Services & Referrals Excel file", type=["xlsx"])
 
